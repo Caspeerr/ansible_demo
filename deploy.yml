@@ -1,22 +1,90 @@
+---
 - hosts: all
   become: yes
   tasks:
-    - name: Install Apache
-      apt:
-        name: apache2
-        state: present
-        update_cache: yes
+    - name: Check disk space
+      shell: df /var/www/html | awk 'NR==2 {print $4}'
+      register: disk_space
+      changed_when: false
 
-    - name: Start and enable Apache
-      service:
-        name: apache2
-        state: started
-        enabled: yes
+    - name: Fail if disk space is low
+      fail:
+        msg: "Not enough disk space"
+      when: disk_space.stdout | int < 100000
 
-    - name: Deploy website
+    - name: Check if port 80 is free
+      wait_for:
+        port: 80
+        state: stopped
+        timeout: 5
+      ignore_errors: yes
+      register: port_check
+
+    - name: Backup existing website
       copy:
-        src: index.html
-        dest: /var/www/html/index.html
-        owner: www-data
-        group: www-data
-        mode: '0644'
+        src: /var/www/html/index.html
+        dest: /var/www/html/index.html.bak
+        remote_src: yes
+      ignore_errors: yes
+
+    - block:
+        - name: Install Apache
+          apt:
+            name: apache2
+            state: present
+            update_cache: yes
+
+        - name: Start and enable Apache
+          service:
+            name: apache2
+            state: started
+            enabled: yes
+
+        - name: Verify Apache is running
+          command: systemctl is-active apache2
+          register: apache_status
+          failed_when: apache_status.stdout != "active"
+          changed_when: false
+
+        - name: Deploy website
+          copy:
+            src: index.html
+            dest: /var/www/html/index.html
+            owner: www-data
+            group: www-data
+            mode: '0644'
+
+        - name: Verify website file exists
+          stat:
+            path: /var/www/html/index.html
+          register: website_file
+          failed_when: not website_file.stat.exists
+
+        - name: Test website is reachable
+          uri:
+            url: http://192.168.56.10
+            status_code: 200
+          retries: 5
+          delay: 10
+          register: result
+          until: result.status == 200
+
+      rescue:
+        - name: Restore backup
+          copy:
+            src: /var/www/html/index.html.bak
+            dest: /var/www/html/index.html
+            remote_src: yes
+          ignore_errors: yes
+
+        - name: Restart Apache
+          service:
+            name: apache2
+            state: restarted
+
+      always:
+        - name: Log deployment result
+          lineinfile:
+            path: /var/log/deployment.log
+            line: "Deployment ran at {{ ansible_date_time.iso8601 }}"
+            create: yes
